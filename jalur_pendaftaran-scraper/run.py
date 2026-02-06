@@ -65,7 +65,6 @@ def is_valid_jalur_object(obj: dict) -> bool:
         )
     )
 
-
 def html_to_text(html_bytes: bytes) -> str:
     try:
         soup = BeautifulSoup(html_bytes.decode("utf-8", errors="ignore"), "lxml")
@@ -73,19 +72,55 @@ def html_to_text(html_bytes: bytes) -> str:
     except Exception:
         return html_bytes.decode("utf-8", errors="ignore")
     
+MONTHS = {
+    # English
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+
+    # Indonesian
+    "januari": 1, "februari": 2, "maret": 3, "april": 4,
+    "mei": 5, "juni": 6, "juli": 7, "agustus": 8,
+    "september": 9, "oktober": 10, "november": 11, "desember": 12,
+}
+
+    
 def is_expired(registration_end: str | None) -> bool:
-    """
-    Return True jika tanggal pendaftaran sudah lewat hari ini.
-    Jika tanggal kosong / tidak bisa diparse → dianggap TIDAK expired.
-    """
     if not registration_end:
         return False
 
+    text = registration_end.strip().lower()
+
+    # 1️⃣ ISO: YYYY-MM-DD
     try:
-        end_date = datetime.fromisoformat(registration_end.strip()).date()
-        return end_date < date.today()
+        d = datetime.fromisoformat(text).date()
+        return d < date.today()
     except Exception:
-        return False
+        pass
+
+    # 2️⃣ Format: 12 March 2025 / 12 Maret 2025
+    m = re.search(r"(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})", text)
+    if m:
+        day = int(m.group(1))
+        month_name = m.group(2)
+        year = int(m.group(3))
+
+        month = MONTHS.get(month_name)
+        if month:
+            try:
+                d = date(year, month, day)
+                return d < date.today()
+            except Exception:
+                pass
+
+    # 3️⃣ Fallback: tahun saja
+    years = re.findall(r"(20\d{2})", text)
+    if years:
+        last_year = max(int(y) for y in years)
+        return last_year < date.today().year
+
+    # 4️⃣ Ambigu → jangan buang
+    return False
 
 
 async def main():
