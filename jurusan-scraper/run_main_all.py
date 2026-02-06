@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import datetime
 import os
 import json
 import time
@@ -238,6 +239,7 @@ def main():
                 out_rows = []
                 for p in programs:
                     jurusan_name = p["name"]
+                    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     out_rows.append({
                         "id": next_id,
@@ -246,8 +248,8 @@ def main():
                         "slug": slugify(jurusan_name),
                         "description": p.get("description", "-"),
                         "is_active": True,
-                        "created_at": None,
-                        "updated_at": None,
+                        "created_at": now_ts,
+                        "updated_at": now_ts,
                         "deleted_at": None,
                         "created_by": None,
                         "updated_by": None,
