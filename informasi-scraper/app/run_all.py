@@ -14,6 +14,7 @@ from app.selector import pick_candidates
 from app.gemini_client import GeminiJSON
 from app.extractors import (
     SCHEMA_IMPORT, RULES_INFO, normalize_info_keys,
+    postprocess_info,
     SCHEMA_VISI, RULES_VISI, normalize_visi,
 )
 from app.mapper_region import load_region_table, match_region
@@ -200,6 +201,8 @@ def main():
                     print("[WARN] Gemini INFO gagal -> isi default '-'")
                     data_info = {}
                 info = normalize_info_keys(data_info)
+                # ✅ post-process: type/status Bahasa Indonesia + koreksi PTN/PTS
+                info = postprocess_info(name=name, website=website_raw, info=info, text_blob=text_info)
 
                 prov_id, city_id = match_region(region_df, info.get("province_name", "-"), info.get("city_name", "-"))
 

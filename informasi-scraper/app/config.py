@@ -6,7 +6,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # Input default 
-DEFAULT_INPUT_XLSX = os.path.join(BASE_DIR, "input", "filemu")
+DEFAULT_INPUT_XLSX = os.path.join(BASE_DIR, "input", "D:\Kehidupan\Sevima\Penugasan2\informasi_scraper_v2\input\edurank_top100_web_resmi.xlsx")
 
 OUT_DIR = os.path.join(BASE_DIR, "output")
 os.makedirs(OUT_DIR, exist_ok=True)

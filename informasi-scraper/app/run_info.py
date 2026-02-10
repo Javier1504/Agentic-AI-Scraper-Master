@@ -6,7 +6,7 @@ from app.config import DEFAULT_INPUT_XLSX, OUT_DIR, STATE_DIR, MAX_PAGES_VISIT, 
 from app.fetcher import PlaywrightFetcher
 from app.selector import pick_candidates
 from app.gemini_client import GeminiJSON
-from app.extractors import SCHEMA_IMPORT, RULES_INFO, normalize_info_keys, enforce_evidence_info
+from app.extractors import SCHEMA_IMPORT, RULES_INFO, normalize_info_keys, enforce_evidence_info, postprocess_info
 from app.mapper_region import load_region_table, match_region
 from app.utils import slugify, acronym, compact_text
 from app.io_excel import load_seed_xlsx, build_import_frame, save_outputs
@@ -87,6 +87,8 @@ def main():
 
             # ✅ anti halu: semua contact & sosmed harus ada bukti di text/links, kalau tidak -> "-"
             info = enforce_evidence_info(info, text=text, links=links)
+            # ✅ post-process: type/status Bahasa Indonesia + koreksi PTN/PTS
+            info = postprocess_info(name=name, website=website, info=info, text_blob=text)
 
             # mapping province_id city_id
             prov_id, city_id = match_region(region_df, info.get("province_name","-"), info.get("city_name","-"))
