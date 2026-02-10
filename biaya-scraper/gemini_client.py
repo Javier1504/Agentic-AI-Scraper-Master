@@ -32,7 +32,7 @@ class GeminiClient:
             contents=prompt,
             config=self._types.GenerateContentConfig(
                 temperature=temperature,
-                response_mime_type="application/json",
+                response_mime_type="text/plain",
             ),
         )
         return (resp.text or "").strip()
@@ -45,7 +45,7 @@ class GeminiClient:
             contents=[prompt, part],
             config=self._types.GenerateContentConfig(
                 temperature=0.2,
-                response_mime_type="application/json",
+                response_mime_type="text/plain",
             ),
         )
         return (resp.text or "").strip()

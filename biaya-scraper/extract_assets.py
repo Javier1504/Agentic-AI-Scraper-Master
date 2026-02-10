@@ -20,39 +20,16 @@ Return: (url, kind, hint, score)
 # match URL that contains an asset extension anywhere (handles querystring: file.pdf?download=1)
 ASSET_EXT_RE = re.compile(r"(?i)\.(pdf|png|jpe?g|webp)(?:$|[?#])")
 
-def _pick_from_srcset(srcset: str, cap_w: int = 2200) -> List[str]:
-    """Pick a srcset URL that is large enough but not too huge.
-
-    If width descriptors (e.g. '1200w') exist, choose the largest <= cap_w.
-    Otherwise fallback to the first URL.
-    Returns a list (0 or 1 url) to keep asset harvesting tight.
-    """
+def _pick_from_srcset(srcset: str) -> List[str]:
+    """Return candidate URLs from a srcset string."""
     if not srcset:
         return []
-    best_under = ("", -1)
-    best_any = ("", -1)
-
+    out: List[str] = []
     for part in srcset.split(","):
-        p = part.strip()
-        if not p:
-            continue
-        toks = p.split()
-        url = toks[0].strip()
-        w = -1
-        if len(toks) >= 2 and toks[1].lower().endswith("w"):
-            try:
-                w = int(re.sub(r"[^0-9]", "", toks[1]))
-            except Exception:
-                w = -1
-
-        if w > best_any[1]:
-            best_any = (url, w)
-        if 0 < w <= cap_w and w > best_under[1]:
-            best_under = (url, w)
-
-    chosen = best_under[0] or best_any[0]
-    return [chosen] if chosen else []
-
+        p = part.strip().split(" ")[0].strip()
+        if p:
+            out.append(p)
+    return out
 
 def _urls_from_style(style: str) -> List[str]:
     """Extract url(...) from inline style="..."""
@@ -66,8 +43,6 @@ def _is_noise(text: str) -> bool:
 
 def score_hint(text: str) -> float:
     t = (text or "").lower()
-    # normalisasi separator agar 'biaya-kuliah' ~ 'biaya kuliah'
-    t = re.sub(r"[^a-z0-9]+", " ", t)
     score = 0.0
     for kw in FEE_KEYWORDS:
         if kw in t:
@@ -94,6 +69,8 @@ def extract_links_and_assets(page_url: str, html: str) -> List[Tuple[str, str, s
             continue
         text = (a.get_text(" ", strip=True) or "")[:200]
         u = safe_join(page_url, href)
+        if not u:
+            continue
         hint = f"{text} {href}".strip()
 
         # anti-noise: skip kalau jelas noise dan tidak ada fee word
@@ -118,6 +95,8 @@ def extract_links_and_assets(page_url: str, html: str) -> List[Tuple[str, str, s
             if not src:
                 continue
             u = safe_join(page_url, src)
+            if not u:
+                continue
             hint = f"{tag}:{attr} {src}"
             low = u.lower()
             kind = "pdf" if (low.endswith(PDF_EXT) or (ASSET_EXT_RE.search(low) and ".pdf" in low)) else "html"
@@ -132,6 +111,8 @@ def extract_links_and_assets(page_url: str, html: str) -> List[Tuple[str, str, s
             if not c:
                 continue
             u = safe_join(page_url, c)
+            if not u:
+                continue
             low = u.lower()
             if not (ASSET_EXT_RE.search(low) or low.endswith(PDF_EXT) or low.endswith(IMG_EXT)):
                 continue
@@ -172,6 +153,8 @@ def extract_links_and_assets(page_url: str, html: str) -> List[Tuple[str, str, s
 
         for c in cand:
             u = safe_join(page_url, c)
+            if not u:
+                continue
             low = u.lower()
             if _looks_like_logo(low):
                 continue
@@ -187,6 +170,8 @@ def extract_links_and_assets(page_url: str, html: str) -> List[Tuple[str, str, s
             if not raw_u:
                 continue
             u = safe_join(page_url, raw_u)
+            if not u:
+                continue
             low = u.lower()
             if not (ASSET_EXT_RE.search(low) or low.endswith(IMG_EXT) or low.endswith(PDF_EXT)):
                 continue
@@ -195,11 +180,89 @@ def extract_links_and_assets(page_url: str, html: str) -> List[Tuple[str, str, s
             sc = score_hint(hint) + (0.8 if page_feeish else 0.2)
             out.append((u, kind, hint, sc))
 
+    # ---------------------------------
+    # Extra: data-* links + onclick links
+    # Banyak template kampus menyimpan URL di data-href/data-url/onclick.
+    # ---------------------------------
+    for el in soup.find_all(True):
+        attrs = el.attrs or {}
+        for k in ["data-href", "data-url", "data-link", "data-src", "data-file"]:
+            v = attrs.get(k)
+            if isinstance(v, str):
+                raw = v.strip()
+                if not raw:
+                    continue
+                # only pick when fee-ish or asset
+                if not (FEE_WORD_RE.search(raw) or ASSET_EXT_RE.search(raw)):
+                    continue
+                u = safe_join(page_url, raw)
+                if not u:
+                    continue
+                low = u.lower()
+                kind = "html"
+                if ".pdf" in low or low.endswith(PDF_EXT):
+                    kind = "pdf"
+                elif any(ext in low for ext in [".png", ".jpg", ".jpeg", ".webp"]):
+                    kind = "image"
+                hint = f"{k} {raw}"[:200]
+                sc = score_hint(hint) + 0.6
+                out.append((u, kind, hint, sc))
+
+        onclick = attrs.get("onclick")
+        if isinstance(onclick, str) and onclick:
+            m = re.search(r"(?:location\.href|window\.open)\s*\(?\s*['\"]([^'\"]+)['\"]", onclick, flags=re.I)
+            if m:
+                raw = m.group(1).strip()
+                if raw and (FEE_WORD_RE.search(raw) or ASSET_EXT_RE.search(raw)):
+                    u = safe_join(page_url, raw)
+                    if u:
+                        low = u.lower()
+                        kind = "pdf" if ".pdf" in low else ("image" if ASSET_EXT_RE.search(low) else "html")
+                        hint = f"onclick {raw}"[:200]
+                        sc = score_hint(hint) + 0.6
+                        out.append((u, kind, hint, sc))
+
+    # ---------------------------------
+    # Extra: URLs inside <script> (PDF/images or fee-ish paths)
+    # ---------------------------------
+    script_text = "\n".join([s.get_text(" ", strip=True) for s in soup.find_all("script") if s.get_text(strip=True)])
+    if script_text:
+        # pick absolute URLs
+        for m in re.finditer(r"https?://[^\s'\"<>]+", script_text):
+            raw = m.group(0)
+            if not (ASSET_EXT_RE.search(raw) or FEE_WORD_RE.search(raw)):
+                continue
+            u = normalize_url(raw)
+            if not u:
+                continue
+            low = u.lower()
+            kind = "pdf" if ".pdf" in low else ("image" if ASSET_EXT_RE.search(low) else "html")
+            hint = f"script {raw}"[:200]
+            sc = score_hint(hint) + 0.4
+            out.append((u, kind, hint, sc))
+        # pick relative fee-ish paths like /ukt/... or /biaya-...
+        for m in re.finditer(r"['\"](/[^'\"]{1,250})['\"]", script_text):
+            raw = m.group(1)
+            if not raw:
+                continue
+            if not (FEE_WORD_RE.search(raw) or ASSET_EXT_RE.search(raw)):
+                continue
+            u = safe_join(page_url, raw)
+            if not u:
+                continue
+            low = u.lower()
+            kind = "pdf" if ".pdf" in low else ("image" if ASSET_EXT_RE.search(low) else "html")
+            hint = f"script_rel {raw}"[:200]
+            sc = score_hint(hint) + 0.4
+            out.append((u, kind, hint, sc))
+
     # normalize + dedup
     seen = set()
     uniq = []
     for u, kind, hint, sc in out:
         u2 = normalize_url(u)
+        if not u2:
+            continue
         key = (u2, kind)
         if key in seen:
             continue

@@ -68,29 +68,27 @@ class PlaywrightFetcher:
             if self._pw:
                 await self._pw.stop()
 
-    async def fetch_html(self, url: str, wait_after_ms: int = 500) -> FetchResult:
+    async def fetch_html(self, url: str, wait_after_ms: int = 1500) -> FetchResult:
         t0 = time.time()
         try:
             context = await self._browser.new_context(ignore_https_errors=True)
             page = await context.new_page()
-
-            # 1) coba load sampai networkidle (lebih stabil untuk konten JS)
+            await page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
+            # Banyak situs kampus render tabel/menunya via JS (wpDataTables/DataTables).
+            # Coba tunggu network idle sebentar (jika tidak tercapai, lanjut saja).
             try:
-                await page.goto(url, timeout=self.timeout_ms, wait_until="networkidle")
-            except Exception:
-                await page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
-
-            # 2) scroll untuk trigger lazyload (img/pdf embed sering muncul setelah scroll)
-            try:
-                for _ in range(3):
-                    await page.mouse.wheel(0, 2000)
-                    await page.wait_for_timeout(400)
+                await page.wait_for_load_state("networkidle", timeout=min(8000, self.timeout_ms))
             except Exception:
                 pass
-
-            if wait_after_ms > 0:
+            # Auto-scroll ringan untuk memicu lazy-load.
+            try:
+                await page.evaluate("""() => { window.scrollTo(0, document.body.scrollHeight); }""")
+                await page.wait_for_timeout(250)
+                await page.evaluate("""() => { window.scrollTo(0, 0); }""")
+            except Exception:
+                pass
+            if wait_after_ms and wait_after_ms > 0:
                 await page.wait_for_timeout(wait_after_ms)
-
             html = await page.content()
             final_url = page.url
             await context.close()

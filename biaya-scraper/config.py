@@ -19,30 +19,11 @@ NOISE_KEYWORDS = [
 PDF_EXT = (".pdf",)
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 
-# Asset boleh lintas domain kalau ditemukan dari halaman resmi (bukan ditebak).
-# Ini penting karena banyak kampus host PDF/gambar di CDN/S3/Drive.
-ALLOWED_ASSET_HOSTS = [
-    "drive.google.com", "docs.google.com", "storage.googleapis.com",
-    "googleusercontent.com", "cloudfront.net", "amazonaws.com",
-    "blob.core.windows.net",
-]
-
 MONEY_HINT_RE = re.compile(r"(?i)(rp\.?\s*)?\d{1,3}([.,]\d{3})+|\b\d{6,}\b")
 
 FEE_WORD_RE = re.compile(
-    r"(?i)\b("
-    r"ukt|"
-    r"spp|"
-    r"spi|"
-    r"ipi|"
-    r"uang[\W_]*pangkal|"
-    r"uang[\W_]*kuliah([\W_]*tunggal)?|"
-    r"biaya[\W_]*(kuliah|pendidikan|studi|registrasi|herregistrasi)|"
-    r"dpp|dana[\W_]*pengembangan|uang[\W_]*gedung|"
-    r"tuition|fee|fees|tarif|iuran"
-    r")\b"
+    r"(?i)\b(ukt|spp|spi|ipi|uang\s*pangkal|biaya\s*(kuliah|pendidikan|studi)|tuition|fee|fees|tarif|iuran)\b"
 )
-
 
 # Hint bahwa konten menyebut program/jurusan/jenjang.
 # Dipakai untuk *validasi ketat* (halaman dianggap benar bila ada PRODI/JENJANG + NOMINAL).
@@ -61,4 +42,28 @@ LEVEL_HINT_RE = re.compile(
     r"keprofesian|profesi|spesialis|pascasarjana|"
     r"undergraduate|graduate|master|phd"
     r")\b"
+)
+
+# Banyak halaman biaya tidak menulis kata "prodi"/"program studi" tetapi langsung
+# menyebut nama jurusan di tabel (mis. "Teknik Informatika", "Manajemen").
+# Regex ini dipakai sebagai sinyal *nama prodi* yang umum di Indonesia.
+PRODI_NAME_RE = re.compile(
+    r"(?i)\b("
+    r"teknik|informatika|sistem\s*informasi|ilmu\s*komputer|data\s*science|"
+    r"manajemen|akuntansi|ekonomi|bisnis|kewirausahaan|administrasi|"
+    r"hukum|hubungan\s*internasional|ilmu\s*politik|pemerintahan|"
+    r"psikologi|komunikasi|desain|dkv|arsitektur|sipil|mesin|elektro|industri|"
+    r"kedokteran|kedokteran\s*gigi|farmasi|keperawatan|kebidanan|kesehatan\s*masyarakat|"
+    r"pendidikan|matematika|fisika|kimia|biologi|statistika|"
+    r"bahasa|sastra|inggris|jepang|arab|"
+    r"pertanian|perikanan|kelautan|peternakan|"
+    r"pariwisata|perhotelan|"
+    r"teknologi\s*informasi|rekayasa\s*perangkat\s*lunak"
+    r")\b"
+)
+
+# Sinyal baris tabel yang mirip "<nama prodi> ... <nominal>".
+PRODI_MONEY_ROW_RE = re.compile(
+    r"(?is)\b([A-Za-z]{3,}(?:\s+[A-Za-z]{3,}){0,8})\b[^\n]{0,60}"
+    r"((?:rp\.?\s*)?\d{1,3}(?:[\.,]\d{3})+|\b\d{6,}\b)"
 )
