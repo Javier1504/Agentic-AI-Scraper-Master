@@ -12,7 +12,7 @@ from utils import (
     normalize_url,
     same_site,
     is_related_domain,
-    dedupe_candidates,      # 🔥 WAJIB
+    dedupe_candidates,      
 )
 
 from extract_assets import (
@@ -40,7 +40,9 @@ HARD_REJECT_KEYWORDS = [
     "scholarship", "kontak", "contact", "lokasi", "location", "peta-situs", "bayar", 
     "dokumen", "animo", "ppds", "logo", "visi-misi", "sejarah", "tentang-kami",
     "pengumuman", "syarat-ketentuan", "terms-and-conditions", "privacy-policy",
-    "inovasi", "research", "riset", "penelitian", "layanan", "service", 
+    "inovasi", "research", "riset", "penelitian", "layanan", "service", "direktori",
+    "perpustakaan", "library", "repository", "download", "forum", "experince", "rektor", "dekan", "staff",
+    "profil", "profile", "career", "karir", "frequently-asked-questions", "faq",
 ]
 
 MAX_ADMISSION_DEPTH = 5
@@ -66,8 +68,8 @@ def hard_reject(url: str) -> bool:
 
 def _in_admission_subtree(url: str, prefixes: set[str], hosts: set[str]) -> bool:
     p = urlparse(url)
-    path = p.path.rstrip("/") + "/"
-    host = p.netloc
+    path = (p.path or "").rstrip("/") + "/"
+    host = (p.netloc or "").lower()
 
     if host in hosts:
         return True
@@ -82,22 +84,9 @@ def admission_score(url: str, hint: str) -> int:
     for k in ADMISSION_ENTRY_KEYWORDS:
         if k in blob:
             s += 2
-    if any(k in blob for k in ["pmb", "admission", "um", "selma", "penerimaan", "seleksi"]):
+    if any(k in blob for k in ["pmb", "admission", "um", "selma", "penerimaan", "seleksi", "pendaftaran mahasiswa baru", "snbp", "snbt", "mandiri", "jadwal", "ppmb"]):
         s += 5
     return s
-
-
-
-# def _priority(url: str) -> int:
-#     u = url.lower()
-#     if "jadwal" in u or "timeline" in u:
-#         return 100
-#     if any(k in u for k in ["snbp", "snbt", "mandiri"]):
-#         return 80
-#     if is_admission_entry(u):
-#         return 60
-#     return 10
-
 
 # =========================
 # MAIN CRAWLER
@@ -162,8 +151,8 @@ async def crawl_site(
 
     for r in admission_roots:
         p = urlparse(r)
-        host = p.netloc
-        path = p.path.rstrip("/")
+        host = (p.netloc or "").lower()
+        path = (p.path or "").rstrip("/")
 
         if host:
             admission_hosts.add(host)
@@ -226,9 +215,6 @@ async def crawl_site(
 
             text_blob = (u + " " + hint).lower()
 
-            # 🔥 PATCH UTAMA:
-            # Semua halaman jadwal ATAU halaman yang mengandung kata jalur
-            # dianggap kandidat. Pemecahan detail dilakukan di extractor.
             is_candidate = (
                 "jadwal" in text_blob
                 or JALUR_WORD_RE.search(text_blob)
@@ -252,7 +238,6 @@ async def crawl_site(
                     q.append((u, depth + 1))
 
     # --- STEP 4: DEDUP (NON-DESTRUCTIVE) ---
-    # --- STEP 4: DEDUP (URL + KIND, AMBIL SCORE TERBAIK) ---
     best = dedupe_candidates(candidates)
 
     info(f"crawl_done | {campus_name} candidates={len(best)}")
