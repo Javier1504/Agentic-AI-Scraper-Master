@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 
 import requests
+from heuristic_expand import heuristic_expand_dom
 from tenacity import retry, stop_after_attempt, wait_exponential
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
@@ -103,6 +104,10 @@ class PlaywrightFetcher:
             await page.wait_for_timeout(800)
 
             menu_links = await extract_menu_links(page)
+
+            # 🔥 HYBRID SCRAPING STEP
+            clicked = await heuristic_expand_dom(page)
+
             html = await page.content()
             final_url = page.url
 

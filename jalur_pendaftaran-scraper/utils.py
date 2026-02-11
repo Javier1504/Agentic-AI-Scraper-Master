@@ -4,12 +4,13 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urlparse, urljoin, urlunparse, parse_qsl, urlencode
 
-def normalize_url(url: str) -> str:
+def normalize_url(url: str, keep_fragment: bool = False) -> str:
     url = (url or "").strip()
     if not url:
         return url
     p = urlparse(url)
-    p = p._replace(fragment="")
+    if not keep_fragment:
+        p = p._replace(fragment="")
     q = [(k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=True)
          if k.lower() not in {"utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid"}]
     p = p._replace(query=urlencode(q))
@@ -26,6 +27,15 @@ def same_site(url: str, base: str) -> bool:
         return uh == bh or uh.endswith("." + bh)
     except Exception:
         return False
+    
+def is_related_domain(url: str, base: str) -> bool:
+    u = urlparse(url).netloc.lower()
+    b = urlparse(base).netloc.lower()
+    return (
+        u == b or
+        u.endswith("." + b) or
+        b.endswith("." + u)
+    )
 
 def safe_join(base: str, href: str) -> str:
     return normalize_url(urljoin(base, href))
@@ -36,6 +46,24 @@ def slugify(text: str) -> str:
     text = re.sub(r"\s+", "-", text)
     text = re.sub(r"-+", "-", text).strip("-")
     return text or "item"
+
+def dedupe_candidates(candidates: list[CandidateLink]) -> list[CandidateLink]:
+    """
+    Hapus candidate duplikat berdasarkan (url, kind).
+    Ambil yang score-nya paling tinggi.
+    """
+    seen: dict[tuple[str, str], CandidateLink] = {}
+
+    for c in candidates:
+        key = (c.url, c.kind)
+        if key not in seen:
+            seen[key] = c
+        else:
+            if c.score > seen[key].score:
+                seen[key] = c
+
+    return list(seen.values())
+
 
 @dataclass
 class CandidateLink:

@@ -4,16 +4,32 @@ from typing import List
 from playwright.async_api import Page
 
 MENU_SELECTORS = [
-    "nav a",
-    "header a",
-    "[role='navigation'] a",
-    ".menu a",
-    ".navbar a",
+    "nav a", "header a", "[role='navigation'] a", ".menu a", ".navbar a",
+    
+    # tambahan umum
+    "ul.menu a", "ul.nav a", "ul.navigation a", ".main-menu a", ".primary-menu a", ".top-menu a",
+
+    # header spesifik
+    "header nav a", ".site-header a", ".header-menu a",
+
+    # bootstrap & framework populer
+    ".navbar-nav a", ".nav-item a", ".nav-link",
+
+    # mega menu / dropdown
+    ".dropdown-menu a", ".dropdown a", ".has-submenu a", ".submenu a",
+
+    # CMS (WordPress, Drupal, dll)
+    "#site-navigation a", "#main-menu a", "#primary-menu a", ".menu-item a",
+
+    # fallback (lebih agresif, opsional)
+    "a[href]",
 ]
 
 MENU_KEYWORDS = [
     "pmb", "pendaftaran", "admission", "registrasi",
     "mahasiswa baru", "snbp", "snbt", "mandiri", "jalur"
+    "selma", "seleksi", "penerimaan", "seleksi-masuk",
+    "jadwal"
 ]
 
 async def extract_menu_links(page: Page) -> List[str]:

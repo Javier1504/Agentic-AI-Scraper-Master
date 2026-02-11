@@ -6,7 +6,7 @@ import re
 # =========================================================
 JALUR_KEYWORDS = [
     "jalur pendaftaran", "jalur seleksi", "jalur masuk", "penerimaan mahasiswa baru",
-    "pmb", "spmb", "admisi", "admission",
+    "pmb", "spmb", "admisi", "admission", "selma",
     "snbp", "snbt", "snmptn", "sbmptn",
     "mandiri", "rpl", "jadwal seleksi", "tahapan seleksi", "prestasi", "cbt",
     "reguler", "internasional", "kelas internasional",

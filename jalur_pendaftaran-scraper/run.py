@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, date
 import json
 import os
+import re
 from io import BytesIO
 from typing import Dict, Any, List
 
@@ -19,6 +20,8 @@ from crawler import crawl_site
 from gemini_client import GeminiClient
 from validator import validate_text_with_gemini, validate_bytes_with_gemini, to_validated
 from extractor import extract_jalur_items_from_text, extract_jalur_items_from_bytes
+from checkpoint import Checkpoint
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
@@ -122,12 +125,61 @@ def is_expired(registration_end: str | None) -> bool:
     # 4️⃣ Ambigu → jangan buang
     return False
 
+def dedupe_jalur_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Menghapus duplikasi jadwal berdasarkan MAKNA,
+    bukan URL.
+    """
+    seen = set()
+    result = []
+
+    for it in items:
+        key = (
+            (it.get("_campus_name") or "").lower(),
+            (it.get("name") or "").lower(),
+            it.get("registration_start"),
+            it.get("registration_end"),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(it)
+
+    return result
+
+def normalize_jalur_item(it: dict) -> dict:
+    it["name"] = (it.get("name") or "").strip()
+    it["slug"] = (it.get("slug") or "").strip().lower()
+    it["description"] = (it.get("description") or "").strip()
+
+    # kosong → None
+    for k in ["registration_start", "registration_end"]:
+        if not it.get(k):
+            it[k] = None
+
+    return it
+
+def is_too_old(it: dict) -> bool:
+    name = (it.get("name") or "").lower()
+    years = re.findall(r"(20\d{2})", name)
+    if years:
+        latest = max(int(y) for y in years)
+        return latest < date.today().year
+    return False
+
+
 
 async def main():
     args = parse_args()
     ensure_outdir(args.outdir)
 
     setup(log_file_path=os.path.join(args.outdir, "run.log"), level=args.log_level)
+    
+    checkpoint = Checkpoint(
+    os.path.join(args.outdir, "checkpoint.json")
+    )
 
     info("start | initializing")
     info(f"config | outdir={args.outdir} max_pages={args.max_pages} concurrency={args.concurrency} no_playwright={args.no_playwright}")
@@ -174,7 +226,13 @@ async def main():
 
 
                 info(f"[{idx}/{total}] CRAWL_DONE univ='{campus}' candidates={len(candidates)}")
-
+                
+                # ===== CHECKPOINT: CRAWL DONE =====
+                state = checkpoint.uni(campus)
+                state["crawl_done"] = True
+                state["candidates"] = [c.__dict__ for c in candidates]
+                checkpoint.save()
+                
                 # save candidates
                 for c in candidates:
                     all_candidates.append({
@@ -194,18 +252,25 @@ async def main():
                     try:
                         if c.kind == "html":
                             fr = await fetch_html_async(c.url)
-                            text = html_to_text(fr.content) if (fr.ok and fr.content) else ""
+                            if not fr.ok or not fr.content:
+                                continue
 
-                            verdict, reason, snippet = validate_text_with_gemini(gemini, text)
+                            full_text = html_to_text(fr.content)
+
+                            verdict, reason, snippet = validate_text_with_gemini(gemini, full_text, c.url, c.official_website)
                             v = to_validated(c, verdict, reason, snippet)
                             all_validated.append(v.__dict__)
                             info(f"validate_result | univ='{campus}' verdict={verdict} reason='{reason[:80]}'")
+                            
+                            # ===== CHECKPOINT: VALIDATED URL =====
+                            checkpoint.uni(campus)["validated_urls"].append(c.url)
+                            checkpoint.save()
 
                             if verdict != "valid" or args.validate_only:
                                 continue
 
                             info(f"extract | univ='{campus}' kind=html url={c.url}")
-                            items = extract_jalur_items_from_text(gemini, text)
+                            items = extract_jalur_items_from_text(gemini, full_text)
                             info(f"extract_done | univ='{campus}' items={len(items)} url={c.url}")
 
                             for it in items:
@@ -216,6 +281,10 @@ async def main():
                                 it["_university_id"] = university_id
                                 if is_valid_jalur_object(it):
                                     all_jalur_items.append(it)
+                                    
+                            # ===== CHECKPOINT: EXTRACTED URL =====
+                            checkpoint.uni(campus)["extracted_urls"].append(c.url)
+                            checkpoint.save()
 
 
                         elif c.kind == "pdf":
@@ -235,6 +304,10 @@ async def main():
                             v = to_validated(c, verdict, reason, snippet)
                             all_validated.append(v.__dict__)
                             info(f"validate_result | univ='{campus}' verdict={verdict} reason='{reason[:80]}'")
+                            
+                            # ===== CHECKPOINT: VALIDATED URL =====
+                            checkpoint.uni(campus)["validated_urls"].append(c.url)
+                            checkpoint.save()
 
                             if verdict != "valid" or args.validate_only:
                                 continue
@@ -251,6 +324,10 @@ async def main():
                                 it["_university_id"] = university_id    
                                 if is_valid_jalur_object(it):
                                     all_jalur_items.append(it)
+                                    
+                            # ===== CHECKPOINT: EXTRACTED URL =====
+                            checkpoint.uni(campus)["extracted_urls"].append(c.url)
+                            checkpoint.save()
 
 
                         elif c.kind == "image":
@@ -266,6 +343,10 @@ async def main():
                             v = to_validated(c, verdict, reason, snippet)
                             all_validated.append(v.__dict__)
                             info(f"validate_result | univ='{campus}' verdict={verdict} reason='{reason[:80]}'")
+                            
+                            # ===== CHECKPOINT: VALIDATED URL =====
+                            checkpoint.uni(campus)["validated_urls"].append(c.url)
+                            checkpoint.save()
 
                             if verdict != "valid" or args.validate_only:
                                 continue
@@ -282,19 +363,28 @@ async def main():
                                 it["_university_id"] = university_id    
                                 if is_valid_jalur_object(it):
                                     all_jalur_items.append(it)
+                                    
+                            # ===== CHECKPOINT: EXTRACTED URL =====
+                            checkpoint.uni(campus)["extracted_urls"].append(c.url)
+                            checkpoint.save()
 
                     except Exception as e:
                         warn(f"validate/extract exception | univ='{campus}' kind={c.kind} url={c.url} err={type(e).__name__}:{e}")
                         v = to_validated(c, "uncertain", f"exception: {type(e).__name__}: {e}", "")
                         all_validated.append(v.__dict__)
-
+                        
+                        # ===== CHECKPOINT: VALIDATED URL (EXCEPTION) =====
+                        checkpoint.uni(campus)["validated_urls"].append(c.url)
+                        checkpoint.save()
+                
+                checkpoint.mark_done(campus)
                 info(f"[{idx}/{total}] DONE univ='{campus}'")
 
+
         total = len(df)
-        tasks = []
         for idx, (_, row) in enumerate(df.iterrows(), start=1):
-            tasks.append(process_one(idx, total, row))
-        await asyncio.gather(*tasks)
+            await process_one(idx, total, row)
+
 
     # SAVE JSON outputs
     cand_path = os.path.join(args.outdir, "candidates_all.json")
@@ -318,10 +408,16 @@ async def main():
         info("DONE | validate-only mode")
         return
 
+    # ===================== DEDUPE JALUR ITEMS =====================
+    info(f"dedupe | before={len(all_jalur_items)}")
+    all_jalur_items = dedupe_jalur_items(all_jalur_items)
+    info(f"dedupe | after={len(all_jalur_items)}")
+
     jalur_json = os.path.join(args.outdir, "jalur_items_extracted.json")
     with open(jalur_json, "w", encoding="utf-8") as f:
         json.dump(all_jalur_items, f, ensure_ascii=False, indent=2)
     info(f"save | jalur_items={jalur_json}")
+
 
     # Build output xlsx based on template columns
     # ===================== BUILD OUTPUT XLSX =====================
@@ -334,9 +430,10 @@ async def main():
     now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for it in all_jalur_items:
-
+        
+        it = normalize_jalur_item(it)
         # FILTER EXPIRED DI SINI SAJA
-        if is_expired(it.get("registration_end")):
+        if is_expired(it.get("registration_end")) or is_too_old(it):
             skipped_expired += 1
             continue
 
