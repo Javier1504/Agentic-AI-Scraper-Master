@@ -23,7 +23,9 @@ NOISE_KEYWORDS = [
     "karir", "career", "alumni",
     "profil", "profile", "sejarah", "history",
     "visi", "misi", "kemahasiswaan",
-    "beasiswa", "scholarship",
+    "beasiswa", "scholarship", "pembelajaran", "layanan", "service",
+    "faq", "frequently asked questions", "kehidupan kampus",
+    "perpustakaan", "library", "repository", " Download ", "experince",
     "download", "repository", "perpustakaan", "library"
 ]
 
