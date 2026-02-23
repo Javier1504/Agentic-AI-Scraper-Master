@@ -1,245 +1,214 @@
-# crawler.py — ADMISSION CRAWLER v2 FINAL (FIXED)
+from __future__ import annotations
 
-from collections import deque
-from typing import List, Set, Tuple
-from urllib.parse import urlparse
+import heapq
+from typing import List, Set, Dict, Tuple, Optional
 
 from bs4 import BeautifulSoup
 
-from config import JALUR_WORD_RE
-from utils import (
-    CandidateLink,
-    normalize_url,
-    same_site,
-    is_related_domain,
-    dedupe_candidates,      
+from config import (
+    JALUR_WORD_RE,
+    NOISE_KEYWORDS,
+    DATE_HINT_RE,
+    DATE_RANGE_RE,
+    LEVEL_HINT_RE,
+    JALUR_DATE_ROW_RE
 )
 
-from extract_assets import (
-    extract_links_and_assets,
-)
-
-from logger import info, warn
-
-from section_extractor import extract_candidate_sections
-from urllib.parse import urlparse
+from utils import CandidateLink, normalize_url, canonical_for_visit, same_site
+from extract_assets import extract_links_and_assets
+from logger import info, debug
 
 
-
-# =========================
-# CONFIG
-# =========================
-
-ADMISSION_ENTRY_KEYWORDS = [
-    "pmb", "ppmb", "admission", "penerimaan", "pendaftaran mahasiswa baru", "selma", "seleksi-masuk", "snbp", "snbt", "mandiri", "jadwal"
-]
-
-HARD_REJECT_KEYWORDS = [
-    "daya-tampung", "kuota", "kapasitas", "program-studi", "prodi", "fakultas", "mbkm",
-     "alumni", "berita", "news", "artikel", "biaya", "fee", "ukt", "beasiswa",
-    "scholarship", "kontak", "contact", "lokasi", "location", "peta-situs", "bayar", 
-    "dokumen", "animo", "ppds", "logo", "visi-misi", "sejarah", "tentang-kami",
-    "pengumuman", "syarat-ketentuan", "terms-and-conditions", "privacy-policy",
-    "inovasi", "research", "riset", "penelitian", "layanan", "service", "direktori",
-    "perpustakaan", "library", "repository", "download", "forum", "experince", "rektor", "dekan", "staff",
-    "profil", "profile", "career", "karir", "frequently-asked-questions", "faq",
-]
-
-MAX_ADMISSION_DEPTH = 5
+def _is_noise_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(k in u for k in NOISE_KEYWORDS)
 
 
-# =========================
-# HELPERS
-# =========================
+def _priority(url: str) -> float:
+    u = (url or "").lower()
 
-def is_admission_entry(url: str) -> bool:
-    u = url.lower()
-    return any(k in u for k in ADMISSION_ENTRY_KEYWORDS)
+    # URL yang sangat kuat mengandung jalur/admission
+    if JALUR_WORD_RE.search(u):
+        return 10.0
+
+    # URL admission umum
+    if any(x in u for x in [
+        "pmb", "ppmb", "admission", "penerimaan", "jalur",
+        "seleksi", "registrasi", "daftar", "jadwal", "snpmb",
+    ]):
+        return 4.0
+
+    return 0.5
 
 
-def hard_reject(url: str) -> bool:
-    u = url.lower()
+def _page_signal_score(html: str) -> float:
+    """
+    Skor sinyal halaman berdasarkan konten (bukan URL saja).
 
-    # Jangan reject halaman jadwal
-    if "jadwal" in u or "timeline" in u:
-        return False
+    Target: menangkap halaman jadwal/jalur walaupun URL tidak eksplisit.
+    """
+    if not html:
+        return 0.0
 
-    return any(k in u for k in HARD_REJECT_KEYWORDS)
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text(" ", strip=True)[:20000]
+        low = text.lower()
 
-def _in_admission_subtree(url: str, prefixes: set[str], hosts: set[str]) -> bool:
-    p = urlparse(url)
-    path = (p.path or "").rstrip("/") + "/"
-    host = (p.netloc or "").lower()
+        score = 0.0
 
-    if host in hosts:
-        return True
-    for pref in prefixes:
-        if path.startswith(pref):
-            return True
-    return False
+        # Ada tanggal → sangat penting untuk jadwal
+        if DATE_HINT_RE.search(text):
+            score += 3.0
 
-def admission_score(url: str, hint: str) -> int:
-    blob = (url + " " + hint).lower()
-    s = 0
-    for k in ADMISSION_ENTRY_KEYWORDS:
-        if k in blob:
-            s += 2
-    if any(k in blob for k in ["pmb", "admission", "um", "selma", "penerimaan", "seleksi", "pendaftaran mahasiswa baru", "snbp", "snbt", "mandiri", "jadwal", "ppmb"]):
-        s += 5
-    return s
+        # Ada rentang tanggal
+        if DATE_RANGE_RE.search(text):
+            score += 2.0
 
-# =========================
-# MAIN CRAWLER
-# =========================
+        # Ada kata jalur/seleksi
+        if JALUR_WORD_RE.search(text):
+            score += 3.0
+
+        # Ada jenjang pendidikan
+        if LEVEL_HINT_RE.search(text):
+            score += 1.5
+
+        # Banyak tabel → biasanya jadwal dalam tabel
+        tables = soup.find_all("table")
+        if tables:
+            score += 1.0
+
+        tr_count = len(soup.find_all("tr"))
+        if tr_count >= 8:
+            score += 1.5
+        elif tr_count >= 4:
+            score += 0.5
+
+        # Hint tabel populer CMS
+        if "datatable" in low or "tablepress" in low:
+            score += 1.0
+
+        # Penalti ringan untuk noise
+        if any(k in low for k in NOISE_KEYWORDS):
+            score -= 0.5
+
+        return score
+
+    except Exception:
+        return 0.0
+
 
 async def crawl_site(
     campus_name: str,
     official_website: str,
-    fetcher,
-    max_pages: int = 80,
+    fetch_html_async,
+    max_pages: int = 200,
+    min_candidate_score: float = 2.0,
 ) -> List[CandidateLink]:
 
-    start = normalize_url(official_website)
+    start = canonical_for_visit(official_website)
+
+    # Priority queue: pop highest priority first.
+    # item = (-prio, counter, url)
+    q: List[Tuple[float, int, str]] = []
+    counter = 0
+    heapq.heappush(q, (-100.0, counter, start))
+
     visited: Set[str] = set()
     candidates: List[CandidateLink] = []
 
-    info(f"admission_discovery | {campus_name}")
-
-    # --- STEP 1: ENTRY POINT FROM MENU ---
-    fr, menu_links = await fetcher.fetch_with_menu(start)
-    roots = [
-        normalize_url(u)
-        for u in menu_links
-        if is_related_domain(u, start)
-        and is_admission_entry(u)
-    ]
-
-    if not roots:
-        warn(f"admission_fallback | {campus_name} | scanning homepage links")
-
-        fr, _ = await fetcher.fetch_with_menu(start)
-        if not fr.ok:
-            return []
-
-        html = fr.content.decode("utf-8", errors="ignore")
-        found = extract_links_and_assets(fr.final_url, html)
-
-        scored = []
-
-        for u, kind, hint, score in found:
-            s = admission_score(u, hint)
-            if s > 0:
-                scored.append((s, u))
-
-            # ambil top kandidat
-        scored.sort(reverse=True)
-        top = [normalize_url(u) for s, u in scored[:3]]
-
-        if top:
-            roots = top
-        else:
-            # fallback terakhir: mulai dari homepage
-            top = [start]
-
-
-    admission_roots = roots[:3]
-    q = deque([(u, 0) for u in admission_roots])
-    
-    from urllib.parse import urlparse
-    admission_prefixes = set()
-    admission_hosts = set()
-
-    for r in admission_roots:
-        p = urlparse(r)
-        host = (p.netloc or "").lower()
-        path = (p.path or "").rstrip("/")
-
-        if host:
-            admission_hosts.add(host)
-
-        if path and path != "/":
-            admission_prefixes.add(path + "/")
-            
-    lock_to_admission = len(admission_prefixes) > 0
-
-
-    # --- STEP 2: BFS CRAWLING ---
     while q and len(visited) < max_pages:
-        url, depth = q.popleft()
+        _, _, url = heapq.heappop(q)
+        url = canonical_for_visit(url)
 
+        if not url:
+            continue
         if url in visited:
             continue
-        if depth > MAX_ADMISSION_DEPTH:
-            continue
-        if not is_related_domain(url, start):
-            continue
-        if hard_reject(url):
-            continue
-        if lock_to_admission and not _in_admission_subtree(url, admission_prefixes, admission_hosts):
+        if not same_site(url, start):
             continue
 
         visited.add(url)
-        info(f"crawl | {campus_name} depth={depth} url={url}")
 
-        fetch_url = normalize_url(url, keep_fragment=False)
-        fr = (await fetcher.fetch_with_menu(url))[0]
-        if not fr.ok:
+        info(f"crawl | univ='{campus_name}' visit={len(visited)}/{max_pages} queue={len(q)} url={url}")
+
+        fr = await fetch_html_async(url)
+        if not fr.ok or not fr.content:
+            debug(f"crawl | univ='{campus_name}' fetch_failed mode={fr.mode} status={fr.status} url={url}")
             continue
 
+        # Hindari duplikasi akibat redirect
+        final_u = canonical_for_visit(fr.final_url or url)
+        if final_u and final_u != url:
+            visited.add(final_u)
+            url = final_u
+
         html = fr.content.decode("utf-8", errors="ignore")
-        found = extract_links_and_assets(fr.final_url, html)
-        
-        sections = extract_candidate_sections(fr.final_url, html)
 
-        for _, context in sections:
-            candidates.append(
-                CandidateLink(
+        # ✅ Content-based signal untuk jalur/jadwal
+        page_sc = _page_signal_score(html)
+
+        if page_sc >= min_candidate_score:
+            candidates.append(CandidateLink(
+                campus_name=campus_name,
+                official_website=start,
+                url=fr.final_url,
+                kind="html",
+                source_page=fr.final_url,
+                context_hint=f"page_signal_score={page_sc:.1f}",
+                score=float(page_sc),
+            ))
+
+        found = extract_links_and_assets(url, html)
+        debug(f"crawl | univ='{campus_name}' found_links={len(found)} page={fr.final_url}")
+
+        for u, kind, hint, sc in found:
+            u = canonical_for_visit(u)
+
+            if not u:
+                continue
+            if not same_site(u, start):
+                continue
+
+            # stop noise pages kecuali sangat kuat jalur
+            if _is_noise_url(u) and not JALUR_WORD_RE.search(u) and sc < 4:
+                continue
+
+            is_jalur_related = bool(
+                JALUR_WORD_RE.search(u)
+                or JALUR_WORD_RE.search(hint)
+                or DATE_HINT_RE.search(hint)
+                or sc >= min_candidate_score
+            )
+
+            if is_jalur_related:
+                candidates.append(CandidateLink(
                     campus_name=campus_name,
-                    official_website=official_website,
-                    url=fr.final_url,          # URL SAMA
-                    kind="html",
+                    official_website=start,
+                    url=u,
+                    kind=kind,
                     source_page=fr.final_url,
-                    context_hint=context,
-                    score=90,                  # tinggi karena section-level
-                )
-            )
-
-        # --- STEP 3: LINK ANALYSIS ---
-        for u, kind, hint, score in found:
-            u = normalize_url(u, keep_fragment=True)
-
-            if not is_related_domain(u, start):
-                continue
-            if hard_reject(u):
-                continue
-
-            text_blob = (u + " " + hint).lower()
-
-            is_candidate = (
-                "jadwal" in text_blob
-                or JALUR_WORD_RE.search(text_blob)
-            )
-
-            if is_candidate:
-                candidates.append(
-                    CandidateLink(
-                        campus_name=campus_name,
-                        official_website=official_website,
-                        url=u,
-                        kind=kind,
-                        source_page=fr.final_url,
-                        context_hint=hint[:300],
-                        score=score,
-                    )
-                )
+                    context_hint=hint[:300],
+                    score=float(sc),
+                ))
+                debug(f"candidate | univ='{campus_name}' kind={kind} score={sc:.1f} url={u}")
 
             if kind == "html" and u not in visited:
-                if (not lock_to_admission) or _in_admission_subtree(u, admission_prefixes, admission_hosts):
-                    q.append((u, depth + 1))
+                pr = _priority(u) + float(sc)
 
-    # --- STEP 4: DEDUP (NON-DESTRUCTIVE) ---
-    best = dedupe_candidates(candidates)
+                # Jika halaman ini sudah kuat sinyal jalur
+                if page_sc >= 5.0:
+                    pr += 1.5
 
-    info(f"crawl_done | {campus_name} candidates={len(best)}")
-    return best
+                counter += 1
+                heapq.heappush(q, (-pr, counter, u))
 
+    # dedup by (url, kind) keep max score
+    best: Dict[Tuple[str, str], CandidateLink] = {}
+    for c in candidates:
+        k = (c.url, c.kind)
+        if k not in best or c.score > best[k].score:
+            best[k] = c
+
+    info(f"crawl_done | univ='{campus_name}' visited={len(visited)} candidates={len(best)}")
+    return list(best.values())

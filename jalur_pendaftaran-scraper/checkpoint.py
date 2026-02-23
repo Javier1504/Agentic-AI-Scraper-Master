@@ -1,40 +1,72 @@
-# checkpoint.py
 from __future__ import annotations
+
 import json
 import os
-from typing import Dict, Any
-from logger import info
+import time
+import hashlib
+from typing import Any, Dict, Optional
 
-class Checkpoint:
-    def __init__(self, path: str):
-        self.path = path
-        self.data: Dict[str, Any] = {"universities": {}}
-        self._load()
+from utils import slugify
 
-    def _load(self):
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    self.data = json.load(f)
-            except Exception:
-                pass
 
-    def save(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
+def make_campus_id(campus_name: str, official_website: str) -> str:
+    """Stable ID per campus based on name + website."""
+    name_part = slugify(campus_name)[:40]
+    h = hashlib.sha1((official_website or "").strip().encode("utf-8", errors="ignore")).hexdigest()[:8]
+    return f"{name_part}_{h}" if name_part else f"campus_{h}"
 
-    def uni(self, campus: str) -> Dict[str, Any]:
-        return self.data["universities"].setdefault(campus, {
-            "crawl_done": False,
-            "candidates": [],
-            "validated_urls": [],
-            "extracted_urls": [],
-            "done": False
-        })
 
-    def mark_done(self, campus: str):
-        self.uni(campus)["done"] = True
-        self.save()
-        info(f"checkpoint | DONE campus='{campus}'")
+def now_iso() -> str:
+    # Simple ISO-ish, no tz. Good enough for logs.
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def atomic_write_json(path: str, obj: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def read_json(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def checkpoint_path(checkpoint_dir: str, campus_id: str) -> str:
+    return os.path.join(checkpoint_dir, f"{campus_id}.json")
+
+
+def init_checkpoint(campus_id: str, campus_name: str, official_website: str) -> Dict[str, Any]:
+    return {
+        "campus_id": campus_id,
+        "campus_name": campus_name,
+        "official_website": official_website,
+        "status": "started",  # started | crawled | done
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "candidates": [],
+        "validated": [],
+        "jalur_items": [],
+        "errors": [],
+        "stats": {
+            "candidates": 0,
+            "validated": 0,
+            "jalur_items": 0,
+        },
+    }
+
+
+def touch_stats(state: Dict[str, Any]) -> None:
+    state["updated_at"] = now_iso()
+    state["stats"] = {
+        "candidates": len(state.get("candidates", []) or []),
+        "validated": len(state.get("validated", []) or []),
+        "jalur_items": len(state.get("jalur_items", []) or []),
+    }
