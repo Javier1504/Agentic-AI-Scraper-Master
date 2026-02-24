@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import List, Dict, Any
 from utils import slugify
+import re
 
 EXTRACT_PROMPT = """Kamu extractor jalur dan jadwal pendaftaran kampus Indonesia untuk import database.
 
@@ -32,7 +33,15 @@ Ekstrak dari konten berikut:
 
 def extract_jalur_items_from_text(gemini, text: str) -> List[Dict[str, Any]]:
     raw = gemini.generate_text(EXTRACT_PROMPT + "\n\nKONTEN:\n" + text[:16000])
-    data = json.loads(raw)
+
+    if not raw or not raw.strip():
+        return []
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    
     out = []
 
     if isinstance(data, list):
@@ -59,7 +68,14 @@ def extract_jalur_items_from_text(gemini, text: str) -> List[Dict[str, Any]]:
 
 def extract_jalur_items_from_bytes(gemini, mime: str, data: bytes) -> List[Dict[str, Any]]:
     raw = gemini.generate_with_bytes(EXTRACT_PROMPT, data=data, mime_type=mime)
-    data = json.loads(raw)
+    if not raw or not raw.strip():
+        return []
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    
     out = []
 
     if isinstance(data, list):
