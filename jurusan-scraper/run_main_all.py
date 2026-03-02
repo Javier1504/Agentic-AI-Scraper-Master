@@ -21,6 +21,7 @@ from app.io_jurusan_excel import (
     save_jurusan_outputs,
     load_jurusan_template,
     load_job_options,
+    load_category_options,
 )
 DEFAULT_UNIV_XLSX = os.path.join(os.path.dirname(__file__), "input.xlsx")
 JURUSAN_TEMPLATE_XLSX = os.path.join(os.path.dirname(__file__), "(2) master - Import Jurusan Umum.xlsx")
@@ -181,6 +182,14 @@ def extract_multi_page(
     programs_all = _dedup_jurusan(programs_all)
     return programs_all, usage_total, blocked
 
+def detect_category_id(jurusan_slug: str, category_slug_map: Dict[str, Any]):
+    jurusan_slug = jurusan_slug.lower()
+
+    for cat_slug, cat_id in category_slug_map.items():
+        if cat_slug in jurusan_slug:
+            return cat_id
+
+    return None
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -195,6 +204,15 @@ def main():
     job_list_text = "\n".join(
         [f"{j['id']} = {j['name']}" for j in job_options]
     ) or "Tidak ada job yang tersedia."
+    
+    # LOAD CATEGORY OPTIONS
+    category_options = load_category_options(JURUSAN_TEMPLATE_XLSX)
+
+    # buat mapping slug → id
+    category_slug_map = {
+        c["slug"].strip().lower(): c["id"]
+        for c in category_options
+    }
     assert os.path.exists(DEFAULT_UNIV_XLSX), (
         f"Input kampus tidak ada: {DEFAULT_UNIV_XLSX}\n"
         f"Taruh input.xlsx di folder proyek (sejajar run_main_all.py)."
@@ -264,10 +282,11 @@ def main():
                 for p in programs:
                     jurusan_name = p["name"]
                     now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    cat_id = detect_category_id(slugify(jurusan_name), category_slug_map)
 
                     out_rows.append({
                         "id": next_id,
-                        "category_id": None,
+                        "category_id": cat_id,
                         "name": jurusan_name,
                         "slug": slugify(jurusan_name),
                         "description": p.get("description", "-"),

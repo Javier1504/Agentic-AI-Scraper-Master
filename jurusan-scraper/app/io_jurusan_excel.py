@@ -56,6 +56,24 @@ def load_job_options(path: str) -> List[Dict[str, Any]]:
 
     return df[["id", "name"]].to_dict("records")
 
+def load_category_options(path: str) -> List[Dict[str, Any]]:
+    xls = pd.ExcelFile(path)
+
+    sheet_name = None
+    for s in xls.sheet_names:
+        if "category" in s.lower():
+            sheet_name = s
+            break
+
+    if not sheet_name:
+        raise ValueError(f"Sheet category tidak ditemukan. Available: {xls.sheet_names}")
+
+    df = pd.read_excel(path, sheet_name=sheet_name)
+
+    df = df.dropna(subset=["id", "slug"])
+
+    return df[["id", "name", "slug"]].to_dict("records")
+
 def load_jurusan_template(path: str) -> pd.DataFrame:
     df = pd.read_excel(path)
     if "id" in df.columns:
