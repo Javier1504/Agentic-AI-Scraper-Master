@@ -16,7 +16,12 @@ from app.config import (
 )
 from app.selector_jurusan import pick_candidates_jurusan
 from app.extractors_jurusan import SCHEMA_JURUSAN, RULES_JURUSAN, normalize_jurusan_item
-from app.io_jurusan_excel import build_jurusan_frame, save_jurusan_outputs, load_jurusan_template
+from app.io_jurusan_excel import (
+    build_jurusan_frame,
+    save_jurusan_outputs,
+    load_jurusan_template,
+    load_job_options,
+)
 DEFAULT_UNIV_XLSX = os.path.join(os.path.dirname(__file__), "input.xlsx")
 JURUSAN_TEMPLATE_XLSX = os.path.join(os.path.dirname(__file__), "(2) master - Import Jurusan Umum.xlsx")
 OUT_XLSX = os.path.join(OUT_DIR, "IMPORT_JURUSAN_FINAL.xlsx")
@@ -38,7 +43,7 @@ def looks_blocked(fetch_res) -> bool:
     html = (getattr(fetch_res, "html", "") or "").lower()
     ok = bool(getattr(fetch_res, "ok", False))
     text = (getattr(fetch_res, "text", "") or "").strip()
-
+    
     if "cloudflare" in html and ("just a moment" in html or "attention required" in html):
         return True
     if "challenge-platform" in html or "cf-chl" in html:
@@ -109,6 +114,7 @@ def extract_multi_page(
     gem: GeminiJSON,
     seed_url: str,
     campus_name: str,
+    job_list_text: str,
     limit_pages: int = MAX_INTERNAL_CANDIDATES,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int], bool]:
     """
@@ -142,8 +148,20 @@ def extract_multi_page(
 
         # log
         print(f"  [PAGE] {idx}/{len(pages)} extract via gemini | {url}", flush=True)
+        
+        rules_with_jobs = RULES_JURUSAN + f"""
 
-        data, usage = gem.extract_json(text=txt, schema=SCHEMA_JURUSAN, system_rules=RULES_JURUSAN)
+        TUGAS TAMBAHAN:
+            - Tentukan job_ids yang PALING SESUAI dari daftar berikut.
+            - HANYA boleh memilih dari daftar ini.
+            - Boleh lebih dari satu.
+            - Jika tidak relevan, isi [].
+
+        DAFTAR JOB:
+        {job_list_text}
+        """
+
+        data, usage = gem.extract_json(text=txt, schema=SCHEMA_JURUSAN, system_rules=rules_with_jobs)
         for k in usage_total:
             usage_total[k] += int((usage or {}).get(k, 0) or 0)
 
@@ -170,7 +188,13 @@ def main():
 
     assert os.path.exists(JURUSAN_TEMPLATE_XLSX), f"Template jurusan tidak ada: {JURUSAN_TEMPLATE_XLSX}"
     _ = load_jurusan_template(JURUSAN_TEMPLATE_XLSX)
+    
+    # LOAD JOB OPTIONS
+    job_options = load_job_options(JURUSAN_TEMPLATE_XLSX)
 
+    job_list_text = "\n".join(
+        [f"{j['id']} = {j['name']}" for j in job_options]
+    ) or "Tidak ada job yang tersedia."
     assert os.path.exists(DEFAULT_UNIV_XLSX), (
         f"Input kampus tidak ada: {DEFAULT_UNIV_XLSX}\n"
         f"Taruh input.xlsx di folder proyek (sejajar run_main_all.py)."
@@ -204,7 +228,7 @@ def main():
 
             try:
                 # multi-page extraction
-                programs, usage1, blocked = extract_multi_page(fetcher, gem, website, name)
+                programs, usage1, blocked = extract_multi_page(fetcher, gem, website, name, job_list_text,)
 
                 for k in total_usage:
                     total_usage[k] += int((usage1 or {}).get(k, 0) or 0)
@@ -256,6 +280,7 @@ def main():
                         "deleted_by": None,
                         "skills": p.get("skills", "-"),
                         "reasons": p.get("reasons", "-"),
+                        "jobable": ",".join(map(str, p.get("jobable", []))),
                     })
                     next_id += 1
 

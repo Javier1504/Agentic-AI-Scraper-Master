@@ -16,6 +16,10 @@ SCHEMA_JURUSAN: Dict[str, Any] = {
                     "skills": {"type": "string"},
                     "reasons": {"type": "string"},   
                     "url": {"type": "string"},
+                    "jobable": {
+                        "type": "array",
+                        "items": {"type": "integer"}
+                        }
                 },
                 "required": ["name"],
             },
@@ -61,6 +65,11 @@ def normalize_jurusan_item(it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     url = _clean_text(it.get("url", "-"), max_len=500)
 
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    
+    job_ids = it.get("jobable", [])
+    if not isinstance(job_ids, list):
+        job_ids = []
+        job_ids = [int(x) for x in job_ids if str(x).isdigit()]
 
     return {
         "id": None,
@@ -77,4 +86,5 @@ def normalize_jurusan_item(it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "deleted_by": None,
         "skills": skills if skills else "-",
         "reasons": reasons if reasons else "-",
+        "jobable": job_ids,
     }

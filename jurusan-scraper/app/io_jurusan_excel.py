@@ -19,6 +19,7 @@ JURUSAN_COLUMNS = [
     "deleted_by",
     "skills",
     "reasons",
+    "jobable",
 ]
 
 def _truncate_cell(x, limit: int = EXCEL_CELL_LIMIT) -> Any:
@@ -29,6 +30,31 @@ def _truncate_cell(x, limit: int = EXCEL_CELL_LIMIT) -> Any:
         return x
     # simpan aman
     return s[: limit - 20] + " ...[TRUNCATED]"
+
+def load_job_options(path: str) -> List[Dict[str, Any]]:
+    xls = pd.ExcelFile(path)
+
+    # cari sheet yang mengandung "job"
+    sheet_name = None
+    for s in xls.sheet_names:
+        if "job" in s.lower():
+            sheet_name = s
+            break
+
+    if not sheet_name:
+        raise ValueError(f"Sheet job tidak ditemukan. Available: {xls.sheet_names}")
+
+    df = pd.read_excel(path, sheet_name=sheet_name)
+
+    # Rename kolom supaya sesuai sistem
+    df = df.rename(columns={
+        "Key": "id",
+        "Value": "name"
+    })
+
+    df = df.dropna(subset=["id", "name"])
+
+    return df[["id", "name"]].to_dict("records")
 
 def load_jurusan_template(path: str) -> pd.DataFrame:
     df = pd.read_excel(path)
