@@ -42,12 +42,13 @@ def parse_args():
     ap.add_argument("--template", required=True, help="Template xlsx Import jalur (kolom DB)")
     ap.add_argument("--outdir", default="out", help="Folder output")
     # Banyak situs kampus butuh eksplor lebih dalam untuk menemukan halaman UKT per-prodi.
-    ap.add_argument("--max-pages", type=int, default=150)
+    ap.add_argument("--max-pages", type=int, default=50)
     ap.add_argument("--min-score", type=float, default=2.0)
     ap.add_argument("--timeout-ms", type=int, default=25000)
     ap.add_argument("--wait-after-ms", type=int, default=500)
     ap.add_argument("--no-playwright", action="store_true", help="Disable Playwright (requests only)")
     ap.add_argument("--validate-only", action="store_true", help="Hanya validasi link, tanpa ekstraksi jalur")
+    ap.add_argument("--debug-dump", action="store_true", help="Simpan rendered HTML dan network log ke --outdir untuk debugging")
     ap.add_argument("--concurrency", type=int, default=2, help="Parallel kampus (hati-hati rate limit)")
     ap.add_argument("--log-level", default=None, help="DEBUG/INFO/WARN/ERROR")
     ap.add_argument("--checkpoint-dir", default=None, help="Folder checkpoint (default: <outdir>/checkpoints)")
@@ -151,7 +152,8 @@ async def main():
 
     sem = asyncio.Semaphore(max(1, args.concurrency))
 
-    async with (PlaywrightFetcher(timeout_ms=args.timeout_ms, headless=True) if not args.no_playwright else _DummyAsyncContext()) as pw:
+    pw_ctx = PlaywrightFetcher(timeout_ms=args.timeout_ms, headless=True, save_dir=args.outdir if args.debug_dump else None, dump_network=args.debug_dump) if not args.no_playwright else _DummyAsyncContext()
+    async with pw_ctx as pw:
 
         async def fetch_html_async(url: str):
             if args.no_playwright:
@@ -162,16 +164,32 @@ async def main():
                 return fr
             return await pw.fetch_html(url, wait_after_ms=args.wait_after_ms)
         async def fetch_best_html_text(url: str, hint: str = "", score: float = 0.0) -> tuple[str, str]:
-            """Ambil teks HTML sebaik mungkin.
+            """Ambil teks HTML sebaik mungkin dengan retry logic.
 
             - Requests dulu (cepat).
             - Jika gate gagal / konten pendek / indikasi tabel JS / link fee-ish, fallback Playwright.
+            - For problematic domains (403, timeouts), retry with Playwright.
 
             Return: (text, mode_used)
             """
             fr = req.fetch(url)
             text = html_to_text(fr.content) if (fr.ok and fr.content) else ""
             mode = fr.mode
+            
+            # Enhanced error handling for 403 / timeouts
+            if not fr.ok:
+                error(f"fetch_best_html_text | url={url} status={fr.status_code} (will retry with Playwright if available)")
+                if args.no_playwright or pw is None:
+                    return "", mode
+                # Try playwright for 403/timeout
+                try:
+                    frp = await pw.fetch_html(url, wait_after_ms=max(args.wait_after_ms, 1500))
+                    if frp.ok and frp.content:
+                        text = html_to_text(frp.content)
+                        return text, frp.mode
+                except Exception as e:
+                    error(f"fetch_best_html_text fallback failed | url={url} error={str(e)}")
+                return "", mode
 
             def _looks_dynamic(t: str) -> bool:
                 lt = (t or "").lower()
@@ -189,12 +207,15 @@ async def main():
             needs_pw = (not fast_local_gate(text)) and (feeish or too_short or js_block or _looks_dynamic(text))
 
             if needs_pw:
-                frp = await pw.fetch_html(url, wait_after_ms=max(args.wait_after_ms, 1500))
-                if frp.ok and frp.content:
-                    text2 = html_to_text(frp.content)
-                    # pilih yang lebih informatif
-                    if fast_local_gate(text2) or (len(text2) > len(text) * 1.2):
-                        return text2, frp.mode
+                try:
+                    frp = await pw.fetch_html(url, wait_after_ms=max(args.wait_after_ms, 1500))
+                    if frp.ok and frp.content:
+                        text2 = html_to_text(frp.content)
+                        # pilih yang lebih informatif
+                        if fast_local_gate(text2) or (len(text2) > len(text) * 1.2):
+                            return text2, frp.mode
+                except Exception as e:
+                    warn(f"Playwright fetch failed | url={url} error={str(e)}")
 
             return text, mode
 
@@ -221,321 +242,382 @@ async def main():
                     return
 
             async with sem:
-                info(f"[{idx}/{total}] START univ='{campus}' id={campus_id} base={base}")
+                try:
+                    info(f"[{idx}/{total}] START univ='{campus}' id={campus_id} base={base}")
 
-                # Load or init checkpoint state
-                cp_state = None
-                if not args.no_resume and not args.force:
-                    cp_state = read_json(cp_path)
+                    # Load or init checkpoint state
+                    cp_state = None
+                    if not args.no_resume and not args.force:
+                        cp_state = read_json(cp_path)
 
-                if not cp_state or args.force:
-                    cp_state = init_checkpoint(campus_id, campus, base)
-                    atomic_write_json(cp_path, cp_state)
+                    if not cp_state or args.force:
+                        cp_state = init_checkpoint(campus_id, campus, base)
+                        atomic_write_json(cp_path, cp_state)
 
-                # If we already crawled candidates in checkpoint, reuse them
-                cached_candidates = cp_state.get("candidates") or []
-                candidates = []
-                if cached_candidates:
-                    # Rebuild CandidateLink objects is optional; we only need dicts for all_candidates,
-                    # but crawl_site returns CandidateLink. We'll keep dicts and process with dict interface.
-                    candidates = cached_candidates
-                    info(f"[{idx}/{total}] RESUME_CANDIDATES univ='{campus}' cached={len(candidates)}")
-                else:
-                    found_links = await crawl_site(
-                        campus_name=campus,
-                        official_website=base,
-                        fetch_html_async=fetch_html_async,
-                        max_pages=args.max_pages,
-                        min_candidate_score=args.min_score,
-                    )
-
-                    info(f"[{idx}/{total}] CRAWL_DONE univ='{campus}' candidates={len(found_links)}")
-
+                    # If we already crawled candidates in checkpoint, reuse them
+                    cached_candidates = cp_state.get("candidates") or []
                     candidates = []
-                    for c in found_links:
-                        candidates.append({
-                            "_campus_id": campus_id,
-                            "campus_name": c.campus_name,
-                            "official_website": c.official_website,
-                            "url": c.url,
-                            "kind": c.kind,
-                            "source_page": c.source_page,
-                            "context_hint": c.context_hint,
-                            "score": c.score,
-                        })
+                    if cached_candidates:
+                        # Rebuild CandidateLink objects is optional; we only need dicts for all_candidates,
+                        # but crawl_site returns CandidateLink. We'll keep dicts and process with dict interface.
+                        candidates = cached_candidates
+                        info(f"[{idx}/{total}] RESUME_CANDIDATES univ='{campus}' cached={len(candidates)}")
+                    else:
+                        found_links = await crawl_site(
+                            campus_name=campus,
+                            official_website=base,
+                            fetch_html_async=fetch_html_async,
+                            max_pages=args.max_pages,
+                            min_candidate_score=args.min_score,
+                        )
 
-                    # Save candidates to checkpoint immediately
-                    cp_state["candidates"] = candidates
-                    cp_state["status"] = "crawled"
+                        info(f"[{idx}/{total}] CRAWL_DONE univ='{campus}' candidates={len(found_links)}")
+
+                        candidates = []
+                        for c in found_links:
+                            candidates.append({
+                                "_campus_id": campus_id,
+                                "campus_name": c.campus_name,
+                                "official_website": c.official_website,
+                                "url": c.url,
+                                "kind": c.kind,
+                                "source_page": c.source_page,
+                                "context_hint": c.context_hint,
+                                "score": c.score,
+                            })
+
+                        # Save candidates to checkpoint immediately
+                        cp_state["candidates"] = candidates
+                        cp_state["status"] = "crawled"
+                        touch_stats(cp_state)
+                        atomic_write_json(cp_path, cp_state)
+
+                    # Push candidates to global output list (dedup is optional)
+                    for c in candidates:
+                        all_candidates.append(c)
+
+                    # Build resume sets
+                    validated_set = set()
+                    for v in (cp_state.get("validated") or []):
+                        key = f"{v.get('kind')}::{v.get('url')}"
+                        validated_set.add(key)
+
+                    extracted_set = set()
+                    for it in (cp_state.get("jalur_items") or []):
+                        su = it.get("_source_url")
+                        if su:
+                            extracted_set.add(su)
+
+                    # validate + extract
+                    writes_since_flush = 0
+                    for j, c in enumerate(candidates, start=1):
+                        # Rebuild CandidateLink object for safe attribute access + reuse existing helper functions
+                        c_obj = CandidateLink(
+                            campus_name=c.get("campus_name") or campus,
+                            official_website=c.get("official_website") or base,
+                            url=c.get("url") or "",
+                            kind=c.get("kind") or "",
+                            source_page=c.get("source_page") or "",
+                            context_hint=c.get("context_hint") or "",
+                            score=float(c.get("score") or 0.0),
+                        )
+
+                        kind = c_obj.kind
+                        url = c_obj.url
+                        key = f"{kind}::{url}"
+
+                        if (not args.no_resume) and (not args.force) and key in validated_set:
+                            info(f"validate | univ='{campus}' {j}/{len(candidates)} SKIP already-validated kind={kind} url={url}")
+                            continue
+
+                        info(f"validate | univ='{campus}' {j}/{len(candidates)} kind={kind} url={url}")
+
+                        try:
+                            if kind == "html":
+                                # ⚡ Banyak tabel UKT/prodi dimuat via JS. Ambil versi HTML terbaik.
+                                try:
+                                    text, mode_used = await fetch_best_html_text(
+                                        url,
+                                        hint=c_obj.context_hint,
+                                        score=c_obj.score,
+                                    )
+                                except Exception as e:
+                                    error(f"fetch error | univ='{campus}' url={url} error={str(e)}")
+                                    text, mode_used = "", "error"
+
+                                if not text:
+                                    info(f"validate_skip | univ='{campus}' kind=html url={url} (empty content)")
+                                    v = {
+                                        "_campus_id": campus_id,
+                                        "campus_name": campus,
+                                        "official_website": base,
+                                        "url": url,
+                                        "kind": kind,
+                                        "source_page": c.get("source_page"),
+                                        "verdict": "invalid",
+                                        "extracted_hint": "(empty content)",
+                                        "_fetch_mode": mode_used,
+                                    }
+                                    all_validated.append(v)
+                                    cp_state["validated"].append(v)
+                                    validated_set.add(key)
+                                    continue
+
+                                try:
+                                    verdict, _reason_unused, snippet = validate_text_with_gemini(gemini, text)
+                                except Exception as e:
+                                    error(f"validation error | univ='{campus}' url={url} error={str(e)}")
+                                    verdict, snippet = "invalid", "(validation error)"
+
+                                # Simpan hasil validasi tanpa "reason" agar output ringkas (hemat token).
+                                v = {
+                                    "_campus_id": campus_id,
+                                    "campus_name": campus,
+                                    "official_website": base,
+                                    "url": url,
+                                    "kind": kind,
+                                    "source_page": c.get("source_page"),
+                                    "verdict": verdict,
+                                    "extracted_hint": snippet,
+                                    "_fetch_mode": mode_used,
+                                }
+                                all_validated.append(v)
+                                cp_state["validated"].append(v)
+                                validated_set.add(key)
+                                info(f"validate_result | univ='{campus}' verdict={verdict}")
+
+                                writes_since_flush += 1
+                                if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
+                                    touch_stats(cp_state)
+                                    atomic_write_json(cp_path, cp_state)
+                                    writes_since_flush = 0
+
+                                if verdict != "valid" or args.validate_only:
+                                    continue
+
+                                if (not args.no_resume) and (not args.force) and url in extracted_set:
+                                    info(f"extract | univ='{campus}' SKIP already-extracted kind=html url={url}")
+                                    continue
+
+                                info(f"extract | univ='{campus}' kind=html url={url}")
+                                try:
+                                    items = extract_jalur_items_from_text(gemini, text)
+                                except Exception as e:
+                                    error(f"extraction error | univ='{campus}' url={url} error={str(e)}")
+                                    items = []
+
+                                info(f"extract_done | univ='{campus}' items={len(items)} url={url}")
+
+                                for it in items:
+                                    it["_source_url"] = url
+                                    it["_source_page"] = c.get("source_page")
+                                    enrich_jalur_item_with_campus(it, campus_id, campus, base)
+                                    all_jalur_items.append(it)
+                                    cp_state["jalur_items"].append(it)
+
+                                extracted_set.add(url)
+                                writes_since_flush += 1
+                                if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
+                                    touch_stats(cp_state)
+                                    atomic_write_json(cp_path, cp_state)
+                                    writes_since_flush = 0
+
+                            elif kind == "pdf":
+                                try:
+                                    fr = req.fetch(url)
+                                    if not fr.ok or not fr.content:
+                                        v = {
+                                            "_campus_id": campus_id,
+                                            "campus_name": campus,
+                                            "official_website": base,
+                                            "url": url,
+                                            "kind": kind,
+                                            "source_page": c.get("source_page"),
+                                            "verdict": "invalid",
+                                            "extracted_hint": "(fetch failed)",
+                                        }
+                                        all_validated.append(v)
+                                        cp_state["validated"].append(v)
+                                        validated_set.add(key)
+                                        continue
+
+                                    pdf_text = read_pdf_text(fr.content)
+
+                                    if pdf_text:
+                                        verdict, _reason_unused, snippet = validate_text_with_gemini(gemini, pdf_text)
+                                    else:
+                                        verdict, _reason_unused, snippet = validate_bytes_with_gemini(gemini, "application/pdf", fr.content)
+                                except Exception as e:
+                                    error(f"pdf validation error | univ='{campus}' url={url} error={str(e)}")
+                                    verdict, snippet, pdf_text = "invalid", "(error)", ""
+
+                                v = {
+                                    "_campus_id": campus_id,
+                                    "campus_name": campus,
+                                    "official_website": base,
+                                    "url": url,
+                                    "kind": kind,
+                                    "source_page": c_obj.source_page,
+                                    "verdict": verdict,
+                                    "extracted_hint": snippet,
+                                }
+                                all_validated.append(v)
+                                cp_state["validated"].append(v)
+                                validated_set.add(key)
+                                info(f"validate_result | univ='{campus}' verdict={verdict}")
+
+                                writes_since_flush += 1
+                                if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
+                                    touch_stats(cp_state)
+                                    atomic_write_json(cp_path, cp_state)
+                                    writes_since_flush = 0
+
+                                if verdict != "valid" or args.validate_only:
+                                    continue
+
+                                if (not args.no_resume) and (not args.force) and url in extracted_set:
+                                    info(f"extract | univ='{campus}' SKIP already-extracted kind=pdf url={url}")
+                                    continue
+
+                                info(f"extract | univ='{campus}' kind=pdf url={url}")
+                                try:
+                                    items = extract_jalur_items_from_text(gemini, pdf_text) if pdf_text else extract_jalur_items_from_bytes(gemini, "application/pdf", fr.content)
+                                except Exception as e:
+                                    error(f"pdf extraction error | univ='{campus}' url={url} error={str(e)}")
+                                    items = []
+
+                                info(f"extract_done | univ='{campus}' items={len(items)} url={url}")
+
+                                for it in items:
+                                    it["_source_url"] = url
+                                    it["_source_page"] = c.get("source_page")
+                                    enrich_jalur_item_with_campus(it, campus_id, campus, base)
+                                    all_jalur_items.append(it)
+                                    cp_state["jalur_items"].append(it)
+
+                                extracted_set.add(url)
+                                writes_since_flush += 1
+                                if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
+                                    touch_stats(cp_state)
+                                    atomic_write_json(cp_path, cp_state)
+                                    writes_since_flush = 0
+
+                            elif kind == "image":
+                                try:
+                                    fr = req.fetch(url)
+                                    if not fr.ok or not fr.content:
+                                        v = {
+                                            "_campus_id": campus_id,
+                                            "campus_name": campus,
+                                            "official_website": base,
+                                            "url": url,
+                                            "kind": kind,
+                                            "source_page": c.get("source_page"),
+                                            "verdict": "invalid",
+                                            "extracted_hint": "(fetch failed)",
+                                        }
+                                        all_validated.append(v)
+                                        cp_state["validated"].append(v)
+                                        validated_set.add(key)
+                                        continue
+
+                                    mime = fr.content_type or "image/jpeg"
+                                    verdict, _reason_unused, snippet = validate_bytes_with_gemini(gemini, mime, fr.content)
+                                except Exception as e:
+                                    error(f"image validation error | univ='{campus}' url={url} error={str(e)}")
+                                    verdict, snippet = "invalid", "(error)"
+
+                                v = {
+                                    "_campus_id": campus_id,
+                                    "campus_name": campus,
+                                    "official_website": base,
+                                    "url": url,
+                                    "kind": kind,
+                                    "source_page": c_obj.source_page,
+                                    "verdict": verdict,
+                                    "extracted_hint": snippet,
+                                }
+                                all_validated.append(v)
+                                cp_state["validated"].append(v)
+                                validated_set.add(key)
+                                info(f"validate_result | univ='{campus}' verdict={verdict}")
+
+                                writes_since_flush += 1
+                                if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
+                                    touch_stats(cp_state)
+                                    atomic_write_json(cp_path, cp_state)
+                                    writes_since_flush = 0
+
+                                if verdict != "valid" or args.validate_only:
+                                    continue
+
+                                if (not args.no_resume) and (not args.force) and url in extracted_set:
+                                    info(f"extract | univ='{campus}' SKIP already-extracted kind=image url={url}")
+                                    continue
+
+                                info(f"extract | univ='{campus}' kind=image url={url}")
+                                try:
+                                    items = extract_jalur_items_from_bytes(gemini, mime, fr.content)
+                                except Exception as e:
+                                    error(f"image extraction error | univ='{campus}' url={url} error={str(e)}")
+                                    items = []
+
+                                info(f"extract_done | univ='{campus}' items={len(items)} url={url}")
+
+                                for it in items:
+                                    it["_source_url"] = url
+                                    it["_source_page"] = c.get("source_page")
+                                    enrich_jalur_item_with_campus(it, campus_id, campus, base)
+                                    all_jalur_items.append(it)
+                                    cp_state["jalur_items"].append(it)
+
+                                extracted_set.add(url)
+                                writes_since_flush += 1
+                                if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
+                                    touch_stats(cp_state)
+                                    atomic_write_json(cp_path, cp_state)
+                                    writes_since_flush = 0
+
+                        except Exception as e:
+                            warn(f"validate/extract exception | univ='{campus}' kind={kind} url={url} err={type(e).__name__}:{e}")
+                            v = {
+                                "_campus_id": campus_id,
+                                "campus_name": campus,
+                                "official_website": base,
+                                "url": url,
+                                "kind": kind,
+                                "source_page": c_obj.source_page,
+                                "verdict": "uncertain",
+                                "extracted_hint": "",
+                                "_error_type": type(e).__name__,
+                            }
+                            all_validated.append(v)
+                            cp_state["validated"].append(v)
+                            validated_set.add(key)
+                            cp_state["errors"].append(type(e).__name__)
+
+                            writes_since_flush += 1
+                            if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
+                                touch_stats(cp_state)
+                                atomic_write_json(cp_path, cp_state)
+                                writes_since_flush = 0
+
+                    # Final flush for this campus
                     touch_stats(cp_state)
+                    cp_state["status"] = "done"
                     atomic_write_json(cp_path, cp_state)
 
-                # Push candidates to global output list (dedup is optional)
-                for c in candidates:
-                    all_candidates.append(c)
+                    info(f"[{idx}/{total}] DONE univ='{campus}'")
 
-                # Build resume sets
-                validated_set = set()
-                for v in (cp_state.get("validated") or []):
-                    key = f"{v.get('kind')}::{v.get('url')}"
-                    validated_set.add(key)
-
-                extracted_set = set()
-                for it in (cp_state.get("jalur_items") or []):
-                    su = it.get("_source_url")
-                    if su:
-                        extracted_set.add(su)
-
-                # validate + extract
-                writes_since_flush = 0
-                for j, c in enumerate(candidates, start=1):
-                    # Rebuild CandidateLink object for safe attribute access + reuse existing helper functions
-                    c_obj = CandidateLink(
-                        campus_name=c.get("campus_name") or campus,
-                        official_website=c.get("official_website") or base,
-                        url=c.get("url") or "",
-                        kind=c.get("kind") or "",
-                        source_page=c.get("source_page") or "",
-                        context_hint=c.get("context_hint") or "",
-                        score=float(c.get("score") or 0.0),
-                    )
-
-                    kind = c_obj.kind
-                    url = c_obj.url
-                    key = f"{kind}::{url}"
-
-                    if (not args.no_resume) and (not args.force) and key in validated_set:
-                        info(f"validate | univ='{campus}' {j}/{len(candidates)} SKIP already-validated kind={kind} url={url}")
-                        continue
-
-                    info(f"validate | univ='{campus}' {j}/{len(candidates)} kind={kind} url={url}")
-
+                except Exception as e:
+                    error(f"[{idx}/{total}] CRITICAL univ='{campus}' error={type(e).__name__}: {str(e)}")
                     try:
-                        if kind == "html":
-                            # ⚡ Banyak tabel UKT/prodi dimuat via JS. Ambil versi HTML terbaik.
-                            text, mode_used = await fetch_best_html_text(
-                                url,
-                                hint=c_obj.context_hint,
-                                score=c_obj.score,
-                            )
-
-                            verdict, _reason_unused, snippet = validate_text_with_gemini(gemini, text)
-                            # Simpan hasil validasi tanpa "reason" agar output ringkas (hemat token).
-                            v = {
-                                "_campus_id": campus_id,
-                                "campus_name": campus,
-                                "official_website": base,
-                                "url": url,
-                                "kind": kind,
-                                "source_page": c.get("source_page"),
-                                "verdict": verdict,
-                                "extracted_hint": snippet,
-                                "_fetch_mode": mode_used,
-                            }
-                            all_validated.append(v)
-                            cp_state["validated"].append(v)
-                            validated_set.add(key)
-                            info(f"validate_result | univ='{campus}' verdict={verdict}")
-
-                            writes_since_flush += 1
-                            if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
-                                touch_stats(cp_state)
-                                atomic_write_json(cp_path, cp_state)
-                                writes_since_flush = 0
-
-                            if verdict != "valid" or args.validate_only:
-                                continue
-
-                            if (not args.no_resume) and (not args.force) and url in extracted_set:
-                                info(f"extract | univ='{campus}' SKIP already-extracted kind=html url={url}")
-                                continue
-
-                            info(f"extract | univ='{campus}' kind=html url={url}")
-                            items = extract_jalur_items_from_text(gemini, text)
-                            info(f"extract_done | univ='{campus}' items={len(items)} url={url}")
-
-                            for it in items:
-                                it["_source_url"] = url
-                                it["_source_page"] = c.get("source_page")
-                                enrich_jalur_item_with_campus(it, campus_id, campus, base)
-                                all_jalur_items.append(it)
-                                cp_state["jalur_items"].append(it)
-
-                            extracted_set.add(url)
-                            writes_since_flush += 1
-                            if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
-                                touch_stats(cp_state)
-                                atomic_write_json(cp_path, cp_state)
-                                writes_since_flush = 0
-
-                        elif kind == "pdf":
-                            fr = req.fetch(url)
-                            if not fr.ok or not fr.content:
-                                v = {
-                                    "_campus_id": campus_id,
-                                    "campus_name": campus,
-                                    "official_website": base,
-                                    "url": url,
-                                    "kind": kind,
-                                    "source_page": c.get("source_page"),
-                                    "verdict": "invalid",
-                                    "extracted_hint": "",
-                                }
-                                all_validated.append(v)
-                                cp_state["validated"].append(v)
-                                validated_set.add(key)
-                                continue
-
-                            pdf_text = read_pdf_text(fr.content)
-
-                            if pdf_text:
-                                verdict, _reason_unused, snippet = validate_text_with_gemini(gemini, pdf_text)
-                            else:
-                                verdict, _reason_unused, snippet = validate_bytes_with_gemini(gemini, "application/pdf", fr.content)
-
-                            v = {
-                                "_campus_id": campus_id,
-                                "campus_name": campus,
-                                "official_website": base,
-                                "url": url,
-                                "kind": kind,
-                                "source_page": c_obj.source_page,
-                                "verdict": verdict,
-                                "extracted_hint": snippet,
-                            }
-                            all_validated.append(v)
-                            cp_state["validated"].append(v)
-                            validated_set.add(key)
-                            info(f"validate_result | univ='{campus}' verdict={verdict}")
-
-                            writes_since_flush += 1
-                            if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
-                                touch_stats(cp_state)
-                                atomic_write_json(cp_path, cp_state)
-                                writes_since_flush = 0
-
-                            if verdict != "valid" or args.validate_only:
-                                continue
-
-                            if (not args.no_resume) and (not args.force) and url in extracted_set:
-                                info(f"extract | univ='{campus}' SKIP already-extracted kind=pdf url={url}")
-                                continue
-
-                            info(f"extract | univ='{campus}' kind=pdf url={url}")
-                            items = extract_jalur_items_from_text(gemini, pdf_text) if pdf_text else extract_jalur_items_from_bytes(gemini, "application/pdf", fr.content)
-                            info(f"extract_done | univ='{campus}' items={len(items)} url={url}")
-
-                            for it in items:
-                                it["_source_url"] = url
-                                it["_source_page"] = c.get("source_page")
-                                enrich_jalur_item_with_campus(it, campus_id, campus, base)
-                                all_jalur_items.append(it)
-                                cp_state["jalur_items"].append(it)
-
-                            extracted_set.add(url)
-                            writes_since_flush += 1
-                            if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
-                                touch_stats(cp_state)
-                                atomic_write_json(cp_path, cp_state)
-                                writes_since_flush = 0
-
-                        elif kind == "image":
-                            fr = req.fetch(url)
-                            if not fr.ok or not fr.content:
-                                v = {
-                                    "_campus_id": campus_id,
-                                    "campus_name": campus,
-                                    "official_website": base,
-                                    "url": url,
-                                    "kind": kind,
-                                    "source_page": c.get("source_page"),
-                                    "verdict": "invalid",
-                                    "extracted_hint": "",
-                                }
-                                all_validated.append(v)
-                                cp_state["validated"].append(v)
-                                validated_set.add(key)
-                                continue
-
-                            mime = fr.content_type or "image/jpeg"
-                            verdict, _reason_unused, snippet = validate_bytes_with_gemini(gemini, mime, fr.content)
-
-                            v = {
-                                "_campus_id": campus_id,
-                                "campus_name": campus,
-                                "official_website": base,
-                                "url": url,
-                                "kind": kind,
-                                "source_page": c_obj.source_page,
-                                "verdict": verdict,
-                                "extracted_hint": snippet,
-                            }
-                            all_validated.append(v)
-                            cp_state["validated"].append(v)
-                            validated_set.add(key)
-                            info(f"validate_result | univ='{campus}' verdict={verdict}")
-
-                            writes_since_flush += 1
-                            if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
-                                touch_stats(cp_state)
-                                atomic_write_json(cp_path, cp_state)
-                                writes_since_flush = 0
-
-                            if verdict != "valid" or args.validate_only:
-                                continue
-
-                            if (not args.no_resume) and (not args.force) and url in extracted_set:
-                                info(f"extract | univ='{campus}' SKIP already-extracted kind=image url={url}")
-                                continue
-
-                            info(f"extract | univ='{campus}' kind=image url={url}")
-                            items = extract_jalur_items_from_bytes(gemini, mime, fr.content)
-                            info(f"extract_done | univ='{campus}' items={len(items)} url={url}")
-
-                            for it in items:
-                                it["_source_url"] = url
-                                it["_source_page"] = c.get("source_page")
-                                enrich_jalur_item_with_campus(it, campus_id, campus, base)
-                                all_jalur_items.append(it)
-                                cp_state["jalur_items"].append(it)
-
-                            extracted_set.add(url)
-                            writes_since_flush += 1
-                            if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
-                                touch_stats(cp_state)
-                                atomic_write_json(cp_path, cp_state)
-                                writes_since_flush = 0
-
-                    except Exception as e:
-                        warn(f"validate/extract exception | univ='{campus}' kind={kind} url={url} err={type(e).__name__}:{e}")
-                        v = {
-                            "_campus_id": campus_id,
-                            "campus_name": campus,
-                            "official_website": base,
-                            "url": url,
-                            "kind": kind,
-                            "source_page": c_obj.source_page,
-                            "verdict": "uncertain",
-                            "extracted_hint": "",
-                            "_error_type": type(e).__name__,
-                        }
-                        all_validated.append(v)
-                        cp_state["validated"].append(v)
-                        validated_set.add(key)
-                        cp_state["errors"].append(type(e).__name__)
-
-                        writes_since_flush += 1
-                        if args.checkpoint_every > 0 and writes_since_flush >= args.checkpoint_every:
-                            touch_stats(cp_state)
-                            atomic_write_json(cp_path, cp_state)
-                            writes_since_flush = 0
-
-                # Final flush for this campus
-                touch_stats(cp_state)
-                cp_state["status"] = "done"
-                atomic_write_json(cp_path, cp_state)
-
-                info(f"[{idx}/{total}] DONE univ='{campus}'")
+                        cp_state = read_json(cp_path) or init_checkpoint(campus_id, campus, base)
+                        cp_state["status"] = "failed"
+                        cp_state["error_message"] = f"{type(e).__name__}: {str(e)}"
+                        atomic_write_json(cp_path, cp_state)
+                    except:
+                        pass  # If even checkpoint fails, continue to next university
 
         total = len(df)
         tasks = []
@@ -626,6 +708,8 @@ async def main():
         rows_out.append(row)
 
     out_df = pd.DataFrame(rows_out, columns=tpl_cols)
+    # 🔥 FILTER HANYA YANG AKTIF
+    out_df = out_df[out_df["is_active"] == True]
     out_xlsx = os.path.join(args.outdir, "import_jalur_filled.xlsx")
     out_df.to_excel(out_xlsx, index=False)
     info(f"save | import_xlsx={out_xlsx}")
