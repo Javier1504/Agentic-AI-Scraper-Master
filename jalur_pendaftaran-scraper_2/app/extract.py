@@ -132,12 +132,29 @@ def extract_jalur_from_url(url: str, fetcher, gemini_api_key: str, model: str, u
     
     def now_wib_str():
         return datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
+    
+    def compute_is_active(end_date):
+        today = datetime.now(ZoneInfo("Asia/Jakarta")).date()
+
+        if not end_date:
+            return True
+
+        try:
+            end = datetime.strptime(end_date, "%Y-%m-%d").date()
+            return end >= today
+        except Exception:
+            return True
 
 
     items = []
     for it in (data.get("items") or []):
         jalur_name = (it.get("name") or "").strip()
         now_wib = now_wib_str()
+        
+        start_date = it.get("start_date")
+        end_date = it.get("end_date")
+
+        is_active = compute_is_active(end_date)
         if not jalur_name:
             continue
 
@@ -147,10 +164,10 @@ def extract_jalur_from_url(url: str, fetcher, gemini_api_key: str, model: str, u
             "name": jalur_name,
             "slug": slugify_simple(jalur_name),
             "description": it.get("description"),
-            "start_date": it.get("start_date"),
-            "end_date": it.get("end_date"),
+            "start_date": start_date,
+            "end_date": end_date,
             "url": final_url,
-            "is_active": True,
+            "is_active": is_active,
             "created_at": now_wib,
             "updated_at": now_wib,
             "deleted_at": None,
