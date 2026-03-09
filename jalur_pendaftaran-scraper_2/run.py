@@ -5,6 +5,7 @@ from app.fetcher import PageFetcher
 from app.extract import extract_jalur_from_url
 from app.writer_xlsx import PricesWorkbookWriter
 from app.utils import load_json, save_json, sha1
+from app.crawler import extract_candidate_links
 
 import os
 import traceback
@@ -87,6 +88,32 @@ def main():
                 model=s.gemini_model,
                 university_id=univ_id,
             )
+            
+            # jika kosong → coba crawl
+            if not items:
+
+                fetched = fetcher.fetch(url)
+
+                if fetched.get("text"):
+
+                    links2 = extract_candidate_links(
+                        fetched["text"],
+                        url,
+                        max_links=10
+                    )
+
+                    for sub in links2:
+
+                        items = extract_jalur_from_url(
+                            url=sub,
+                            fetcher=fetcher,
+                            gemini_api_key=s.gemini_api_key,
+                            model=s.gemini_model,
+                            university_id=univ_id,
+                        )
+
+                        if items:
+                            break
 
             if items:
                 writer.append_items(items)
